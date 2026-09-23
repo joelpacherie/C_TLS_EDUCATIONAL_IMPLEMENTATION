@@ -33,7 +33,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-// POSIX
+// POSIX NETWORKING
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
 
 // ==================================================================================================================
 // - MARK: TOOLS ----------------------------------------------------------------------------------------------------
@@ -676,8 +681,308 @@ void tls13_derive_handshake_keys(const uint8_t ecdh_shared_secret[32],
     hkdf_expand_label(client_hs_traffic_secret, 32, "iv",  NULL, 0, 12, client_iv);
 }
 
-int main(int argc, const char * argv[]) {
+
+// ==================================================================================================================
+// - MARK: TCP EXCHANGES --------------------------------------------------------------------------------------------
+// ==================================================================================================================
+static void write_u16(uint8_t *buf, size_t *pos, uint16_t val) {
+    buf[(*pos)++] = (val >> 8) & 0xFF;
+    buf[(*pos)++] = val & 0xFF;
+}
+
+static void write_u24(uint8_t *buf, size_t *pos, uint32_t val) {
+    buf[(*pos)++] = (val >> 16) & 0xFF;
+    buf[(*pos)++] = (val >> 8) & 0xFF;
+    buf[(*pos)++] = val & 0xFF;
+}
+
+static void write_bytes(uint8_t *buf, size_t *pos, const uint8_t *src, size_t len) {
+    memcpy(&buf[*pos], src, len);
+    *pos += len;
+}
+
+// Builds a compliant TLS 1.3 ClientHello record with SNI (google.com) and X25519 KeyShare
+static size_t build_client_hello_google(uint8_t *buf, const char *hostname, const uint8_t client_pub_key[32]) {
+    size_t pos = 0;
+
+    // 1. Record Header (TLS Plaintext)
+    buf[pos++] = 0x16; // Handshake Record Type
+    buf[pos++] = 0x03; buf[pos++] = 0x01; // Legacy Record Version (TLS 1.0)
     
-    printf("Hello, World!\n");
+    size_t record_len_pos = pos;
+    pos += 2; // Placeholder for record payload length
+
+    size_t handshake_start = pos;
+
+    // 2. Handshake Header
+    buf[pos++] = 0x01; // Handshake Type: ClientHello
+    size_t hs_len_pos = pos;
+    pos += 3; // Placeholder for 24-bit handshake length
+
+    size_t hs_body_start = pos;
+
+    // 3. ClientHello Body
+    buf[pos++] = 0x03; buf[pos++] = 0x03; // Legacy Client Version: TLS 1.2
+
+    // Client Random (32 Bytes)
+    for (int i = 0; i < 32; i++) buf[pos++] = (uint8_t)(i + 0x10);
+
+    // Legacy Session ID (32 Bytes)
+    buf[pos++] = 32;
+    for (int i = 0; i < 32; i++) buf[pos++] = 0x55;
+
+    // Cipher Suites (1 suite: TLS_AES_128_GCM_SHA256 = 0x1301)
+    write_u16(buf, &pos, 2);
+    write_u16(buf, &pos, 0x1301);
+
+    // Compression Methods (0x00 null)
+    buf[pos++] = 1;
+    buf[pos++] = 0;
+
+    // 4. Extensions Section
+    size_t ext_len_pos = pos;
+    pos += 2;
+    size_t ext_start = pos;
+
+    // Extension A: server_name (SNI = 0x0000)
+    size_t host_len = strlen(hostname);
+    write_u16(buf, &pos, 0x0000);
+    write_u16(buf, &pos, (uint16_t)(host_len + 5)); // Ext length
+    write_u16(buf, &pos, (uint16_t)(host_len + 3)); // ServerName list length
+    buf[pos++] = 0x00;                              // NameType: host_name
+    write_u16(buf, &pos, (uint16_t)host_len);       // Hostname length
+    write_bytes(buf, &pos, (const uint8_t *)hostname, host_len);
+
+    // Extension B: supported_versions (0x002b) -> TLS 1.3 (0x0304)
+    write_u16(buf, &pos, 0x002b);
+    write_u16(buf, &pos, 3);
+    buf[pos++] = 2;
+    write_u16(buf, &pos, 0x0304);
+
+    // Extension C: supported_groups (0x000a) -> X25519 (0x001d)
+    write_u16(buf, &pos, 0x000a);
+    write_u16(buf, &pos, 4); // Ext length
+    write_u16(buf, &pos, 2); // Group list length
+    write_u16(buf, &pos, 0x001d);
+
+    // Extension D: signature_algorithms (0x000d)
+    write_u16(buf, &pos, 0x000d);
+    write_u16(buf, &pos, 8); // Ext length
+    write_u16(buf, &pos, 6); // SigAlg list length
+    write_u16(buf, &pos, 0x0403); // ecdsa_secp256r1_sha256
+    write_u16(buf, &pos, 0x0804); // rsa_pss_rsae_sha256
+    write_u16(buf, &pos, 0x0401); // rsa_pkcs1_sha256
+
+    // Extension E: key_share (0x0033) -> X25519 Public Key
+    write_u16(buf, &pos, 0x0033);
+    write_u16(buf, &pos, 38);   // Ext length
+    write_u16(buf, &pos, 36);   // Client key shares vector length
+    write_u16(buf, &pos, 0x001d); // Named Group: x25519
+    write_u16(buf, &pos, 32);   // Key exchange length
+    write_bytes(buf, &pos, client_pub_key, 32);
+
+    // Backfill Header Lengths
+    uint16_t total_ext_len = (uint16_t)(pos - ext_start);
+    buf[ext_len_pos]     = (total_ext_len >> 8) & 0xFF;
+    buf[ext_len_pos + 1] = total_ext_len & 0xFF;
+
+    uint32_t total_hs_len = (uint32_t)(pos - hs_body_start);
+    buf[hs_len_pos]     = (total_hs_len >> 16) & 0xFF;
+    buf[hs_len_pos + 1] = (total_hs_len >> 8) & 0xFF;
+    buf[hs_len_pos + 2] = total_hs_len & 0xFF;
+
+    uint16_t total_record_len = (uint16_t)(pos - handshake_start);
+    buf[record_len_pos]     = (total_record_len >> 8) & 0xFF;
+    buf[record_len_pos + 1] = total_record_len & 0xFF;
+
+    return pos;
+}
+
+// Parses Google's ServerHello response frame and isolates the X25519 KeyShare
+static int parse_server_hello_key_share(const uint8_t *buf, size_t buf_len,
+                                        uint8_t server_pub_key[32],
+                                        size_t *sh_handshake_len) {
+    if (buf_len < 5) return -1;
+    if (buf[0] != 0x16) return -2; // Not Handshake record
+
+    size_t pos = 5;
+    if (buf[pos] != 0x02) return -3; // Not ServerHello
+
+    // Parse Handshake Payload Length
+    uint32_t hs_len = ((uint32_t)buf[pos + 1] << 16) | ((uint32_t)buf[pos + 2] << 8) | buf[pos + 3];
+    *sh_handshake_len = hs_len + 4; // Include 4-byte handshake header
+
+    pos += 4; // Skip Handshake header
+    pos += 2; // Skip legacy_version
+    pos += 32; // Skip random
+
+    uint8_t sess_id_len = buf[pos++];
+    pos += sess_id_len;
+
+    pos += 2; // Skip cipher_suite
+    pos += 1; // Skip compression_method
+
+    if (pos + 2 > buf_len) return -4;
+    uint16_t ext_total_len = (buf[pos] << 8) | buf[pos + 1];
+    pos += 2;
+
+    size_t ext_end = pos + ext_total_len;
+    while (pos + 4 <= ext_end && pos + 4 <= buf_len) {
+        uint16_t ext_type = (buf[pos] << 8) | buf[pos + 1];
+        uint16_t ext_len  = (buf[pos + 2] << 8) | buf[pos + 3];
+        pos += 4;
+
+        if (ext_type == 0x0033) { // key_share extension
+            if (ext_len < 36) return -5;
+            uint16_t group = (buf[pos] << 8) | buf[pos + 1];
+            uint16_t klen  = (buf[pos + 2] << 8) | buf[pos + 3];
+            if (group == 0x001d && klen == 32) {
+                memcpy(server_pub_key, &buf[pos + 4], 32);
+                return 0; // Success
+            }
+        }
+        pos += ext_len;
+    }
+    return -6;
+}
+
+// POSIX TCP Client Connection Helper
+static int connect_tcp(const char *ip, uint16_t port) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) return -1;
+
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+
+    if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+    return sockfd;
+}
+
+// DNS Resolution and Socket Creation for Hostname:Port
+static int connect_to_host(const char *hostname, const char *port) {
+    struct addrinfo hints, *res, *p;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;     // IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM; // TCP
+
+    if (getaddrinfo(hostname, port, &hints, &res) != 0) return -1;
+
+    int sockfd = -1;
+    for (p = res; p != NULL; p = p->ai_next) {
+        sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sockfd < 0) continue;
+        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0) break;
+        close(sockfd);
+        sockfd = -1;
+    }
+    freeaddrinfo(res);
+    return sockfd;
+}
+
+int main(int argc, const char * argv[]) {
+    printf("====================================================================\n");
+    printf("       Standalone TLS 1.3 Zero-Dependency Client Architecture       \n");
+    printf("                             C LANGUAGE                             \n");
+    printf("                        JOEL PACHERIE - 2026                        \n");
+    printf("====================================================================\n\n");
+    
+    // STEP 0: Request config:
+    const char *target_host = "google.com"; // will be dynamic later on..
+    const char *target_port = "443"; // https
+    
+    
+    // STEP 1: Generate Client X25519 Ephemeral Keypair
+    uint8_t client_priv[32] = { // hardcoded for debug.. must be replaced by entropy 256
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
+    };
+    uint8_t base_point[32] = {9};
+    uint8_t client_pub[32];
+    x25519(client_pub, client_priv, base_point);
+    print_hex("Client X25519 Public Key", client_pub, 32);
+    
+    // 2. Construct ClientHello Frame with Google SNI
+    uint8_t ch_buf[512];
+    size_t ch_len = build_client_hello_google(ch_buf, target_host, client_pub);
+    printf("ClientHello Wire Size        : %zu Bytes\n", ch_len);
+
+    // 3. Initialize Handshake Transcript Hash
+    sha256_ctx transcript_ctx;
+    sha256_init(&transcript_ctx);
+    // Hash the ClientHello Handshake payload (exclude 5-byte Record Header)
+    sha256_update(&transcript_ctx, ch_buf + 5, ch_len - 5);
+
+    // 4. DNS Query & TCP Connect
+    printf("Connecting to %s:%s via POSIX TCP...\n", target_host, target_port);
+    int fd = connect_to_host(target_host, target_port);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Socket connection failed to %s:%s\n", target_host, target_port);
+        return EXIT_FAILURE;
+    }
+    printf("TCP Socket Connected        : FD %d\n", fd);
+
+    // 5. Send ClientHello over Wire
+    ssize_t sent = send(fd, ch_buf, ch_len, 0);
+    printf("Sent ClientHello Frame      : %zd Bytes\n", sent);
+
+    // 6. Receive Google's Live TLS Response
+    uint8_t rx_buf[4096];
+    ssize_t recvd = recv(fd, rx_buf, sizeof(rx_buf), 0);
+    close(fd);
+
+    if (recvd <= 0) {
+        fprintf(stderr, "ERROR: Failed to receive response from Google.\n");
+        return EXIT_FAILURE;
+    }
+    printf("Received Server TLS Stream   : %zd Bytes\n", recvd);
+
+    // 7. Parse Google's ServerHello & Extract KeyShare
+    uint8_t google_pub[32];
+    size_t sh_hs_len = 0;
+    int res = parse_server_hello_key_share(rx_buf, (size_t)recvd, google_pub, &sh_hs_len);
+
+    if (res != 0) {
+        fprintf(stderr, "ERROR: Failed to parse ServerHello KeyShare (Code: %d)\n", res);
+        return EXIT_FAILURE;
+    }
+
+    print_hex("Google X25519 Public Key", google_pub, 32);
+
+    // Feed exact ServerHello Handshake Payload into Transcript Hash
+    sha256_update(&transcript_ctx, rx_buf + 5, sh_hs_len);
+
+    // 8. Execute X25519 Diffie-Hellman Key Agreement against Google's Key
+    uint8_t shared_secret_Z[32];
+    x25519(shared_secret_Z, client_priv, google_pub);
+    print_hex("Derived Shared Secret Z", shared_secret_Z, 32);
+
+    // 9. Finalize Transcript Hash & Derive Live HKDF Traffic Keys
+    uint8_t transcript_hash[32];
+    sha256_final(&transcript_ctx, transcript_hash);
+    print_hex("Handshake Transcript Hash H", transcript_hash, 32);
+
+    uint8_t c_hs_traffic[32], s_hs_traffic[32];
+    uint8_t client_key[16], client_iv[12];
+    tls13_derive_handshake_keys(shared_secret_Z, transcript_hash,
+                                c_hs_traffic, s_hs_traffic,
+                                client_key, client_iv);
+
+    printf("\n=== Live HKDF Key Schedule Outputs (Google TLS 1.3) ===\n");
+    print_hex("Client HS Traffic Secret", c_hs_traffic, 32);
+    print_hex("Server HS Traffic Secret", s_hs_traffic, 32);
+    print_hex("Client Record AES Key   ", client_key, 16);
+    print_hex("Client Record IV        ", client_iv, 12);
+    
+    printf("OK -> Exit\n");
     return EXIT_SUCCESS;
 }
